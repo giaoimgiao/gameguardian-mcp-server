@@ -103,8 +103,24 @@ func objectSchema(desc string, props map[string]interface{}, required []string) 
 
 var tools = []toolDef{
 	{
-		Name: "gg_status", Title: "会话状态", Description: "查看MCP会话状态: 当前附加进程、内存读写模式(内核/后备)、搜索结果数量。",
+		Name: "gg_status", Title: "会话状态", Description: "查看MCP会话状态: 当前附加进程、内存读写模式(内核/后备)、搜索结果数量、GG绑定状态。",
 		InputSchema: objectSchema("无参数", map[string]interface{}{}, []string{}),
+	},
+	{
+		Name: "gg_bind_gg", Title: "绑定GG修改器", Description: "自主发现并绑定GG修改器(改版随机包名也能找到: 特征/data/data/*/files/GG-*目录+进程存活)。绑定信息持久化, 重启MCP不丢失; 进程死了自动标记失效, 可重新绑定。可选指定package强制绑定特定包。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"package": strSchema("可选: 指定包名绑定(默认自动扫描发现)"),
+		}, []string{}),
+	},
+	{
+		Name: "gg_unbind_gg", Title: "解绑GG修改器", Description: "解除当前绑定的GG修改器, 清除持久化绑定信息。",
+		InputSchema: objectSchema("无参数", map[string]interface{}{}, []string{}),
+	},
+	{
+		Name: "gg_switch_gg", Title: "换绑GG修改器", Description: "重新发现并换绑另一个GG修改器(比如装了新版本随机包名变了)。等于重新执行绑定。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"package": strSchema("可选: 指定新包名换绑(默认自动扫描发现)"),
+		}, []string{}),
 	},
 	{
 		Name: "gg_list_processes", Title: "进程列表", Description: "列出进程(pid/名称/命令行/uid)。可配置: query过滤, includeKernel(是否含内核线程,默认false), appOnly(仅应用进程), sort(active/pid/adj/name), limit+offset分页扩展。",
@@ -414,8 +430,108 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 			"mode":     modes,
 			"results":  cnt,
 			"frozen":   len(session.Frozen),
+			"ggBind":   ggBindStatus(),
 		}, nil
 
+	case "gg_bind_gg":
+		pkg := getStr(args, "package")
+		var bind *GGBindInfo
+		var err error
+		if pkg != "" {
+			// 指定包名绑定: 验证特征目录+进程
+			ggDir := "/data/data/" + pkg + "/files"
+			fes, err2 := os.ReadDir(ggDir)
+			if err2 != nil {
+				return nil, fmt.Errorf("包 %s 无files目录: %v", pkg, err2)
+			}
+			for _, fe := range fes {
+				if fe.IsDir() && strings.HasPrefix(fe.Name(), "GG-") {
+					d := ggDir + "/" + fe.Name()
+					if _, err3 := os.Stat(d + "/version.gg"); err3 != nil {
+						continue
+					}
+					pid := findProcessPid(pkg)
+					if pid == 0 {
+						return nil, fmt.Errorf("GG进程未运行: %s", pkg)
+					}
+					ver := ""
+					if b, _ := os.ReadFile(d + "/version.gg"); b != nil {
+						ver = strings.TrimSpace(string(b))
+					}
+					bind = &GGBindInfo{Package: pkg, PID: pid, DataDir: "/data/data/" + pkg, GGDir: d, Version: ver, BindTime: time.Now().Format("2006-01-02 15:04:05")}
+					break
+				}
+			}
+			if bind == nil {
+				return nil, fmt.Errorf("包 %s 无GG特征目录(files/GG-*)", pkg)
+			}
+		} else {
+			bind, err = DiscoverGG()
+			if err != nil {
+				return nil, err
+			}
+		}
+		cfg.GGBind = *bind
+		if err := cfg.Save(); err != nil {
+			return nil, fmt.Errorf("绑定成功但持久化失败: %v", err)
+		}
+		return map[string]interface{}{
+			"bound": true, "package": bind.Package, "pid": bind.PID,
+			"ggDir": bind.GGDir, "version": bind.Version, "bindTime": bind.BindTime,
+		}, nil
+	case "gg_unbind_gg":
+		pkg := cfg.GGBind.Package
+		cfg.GGBind = GGBindInfo{}
+		if err := cfg.Save(); err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{"unbound": pkg, "bound": false}, nil
+	case "gg_switch_gg":
+		pkg := getStr(args, "package")
+		var bind *GGBindInfo
+		var err error
+		if pkg != "" {
+			ggDir := "/data/data/" + pkg + "/files"
+			fes, err2 := os.ReadDir(ggDir)
+			if err2 != nil {
+				return nil, fmt.Errorf("包 %s 无files目录: %v", pkg, err2)
+			}
+			for _, fe := range fes {
+				if fe.IsDir() && strings.HasPrefix(fe.Name(), "GG-") {
+					d := ggDir + "/" + fe.Name()
+					if _, err3 := os.Stat(d + "/version.gg"); err3 != nil {
+						continue
+					}
+					pid := findProcessPid(pkg)
+					if pid == 0 {
+						return nil, fmt.Errorf("GG进程未运行: %s", pkg)
+					}
+					ver := ""
+					if b, _ := os.ReadFile(d + "/version.gg"); b != nil {
+						ver = strings.TrimSpace(string(b))
+					}
+					bind = &GGBindInfo{Package: pkg, PID: pid, DataDir: "/data/data/" + pkg, GGDir: d, Version: ver, BindTime: time.Now().Format("2006-01-02 15:04:05")}
+					break
+				}
+			}
+			if bind == nil {
+				return nil, fmt.Errorf("包 %s 无GG特征目录(files/GG-*)", pkg)
+			}
+		} else {
+			bind, err = DiscoverGG()
+			if err != nil {
+				return nil, err
+			}
+		}
+		old := cfg.GGBind.Package
+		cfg.GGBind = *bind
+		if err := cfg.Save(); err != nil {
+			return nil, fmt.Errorf("换绑成功但持久化失败: %v", err)
+		}
+		return map[string]interface{}{
+			"switched": true, "from": old, "to": bind.Package, "pid": bind.PID,
+			"ggDir": bind.GGDir, "version": bind.Version,
+		}, nil
 	case "gg_list_processes":
 		includeKernel, _ := args["includeKernel"].(bool)
 		appOnly, _ := args["appOnly"].(bool)
@@ -1751,6 +1867,25 @@ func runShell(cmd string) (string, error) {
 }
 
 // ---------- HTTP MCP 入口 ----------
+// ggBindStatus 返回GG绑定状态(用于gg_status)
+func ggBindStatus() map[string]interface{} {
+	b := cfg.GGBind
+	if b.Package == "" {
+		return map[string]interface{}{"bound": false}
+	}
+	pid, alive := VerifyBind(b)
+	if !alive {
+		return map[string]interface{}{
+			"bound": false, "package": b.Package, "stale": true,
+			"ggDir": b.GGDir, "hint": "GG进程已退出, 用gg_bind_gg重新绑定",
+		}
+	}
+	return map[string]interface{}{
+		"bound": true, "package": b.Package, "pid": pid,
+		"ggDir": b.GGDir, "version": b.Version, "bindTime": b.BindTime,
+	}
+}
+
 func main() {
 	addr := ":8788"
 	if len(os.Args) > 1 {

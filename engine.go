@@ -644,6 +644,17 @@ type Config struct {
 	ResultsDefaultLimit int `json:"resultsDefaultLimit"` // 结果查看默认条数
 	ResultsMaxLimit    int `json:"resultsMaxLimit"`    // 结果查看最大条数
 	SetAllMax          int `json:"setAllMax"`          // 一键全改最大地址数
+	GGBind             GGBindInfo `json:"ggBind"`      // 绑定的GG修改器(自主发现, 防丢失)
+}
+
+// GGBindInfo 绑定的GG修改器信息(随机包名改版GG, 每次安装包名会变)
+type GGBindInfo struct {
+	Package  string `json:"package"`  // 随机包名, 如 com.gtswfioqda
+	PID      int    `json:"pid"`      // GG进程PID
+	DataDir  string `json:"dataDir"`  // /data/data/<pkg>
+	GGDir    string `json:"ggDir"`    // GG存档目录, 如 .../files/GG-rm1m
+	Version  string `json:"version"`  // version.gg内容
+	BindTime string `json:"bindTime"` // 绑定时间
 }
 
 func DefaultConfig() *Config {
@@ -679,6 +690,95 @@ func LoadConfig() *Config {
 		return DefaultConfig()
 	}
 	return c
+}
+// ---------- GG修改器自主发现与绑定 ----------
+// 改版GG随机包名(如com.gtswfioqda), 每次安装都变, 不能写死。
+// 特征: /data/data/<pkg>/files/GG-*/ 目录(含version.gg + lib5.so) + 进程在运行。
+func findProcessPid(pkg string) int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	for _, e := range entries {
+		name := e.Name()
+		allDigit := true
+		for _, ch := range name {
+			if ch < '0' || ch > '9' {
+				allDigit = false
+				break
+			}
+		}
+		if !allDigit {
+			continue
+		}
+		cmdline, err := os.ReadFile("/proc/" + name + "/cmdline")
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(cmdline), pkg) {
+			pid, _ := strconv.Atoi(name)
+			return pid
+		}
+	}
+	return 0
+}
+
+// DiscoverGG 扫描所有已安装应用, 找运行中的GG修改器(特征目录GG-* + 进程存活)
+func DiscoverGG() (*GGBindInfo, error) {
+	dd, err := os.ReadDir("/data/data")
+	if err != nil {
+		return nil, fmt.Errorf("无法扫描/data/data: %v", err)
+	}
+	for _, d := range dd {
+		if !d.IsDir() {
+			continue
+		}
+		pkg := d.Name()
+		filesDir := "/data/data/" + pkg + "/files"
+		fes, err := os.ReadDir(filesDir)
+		if err != nil {
+			continue
+		}
+		for _, fe := range fes {
+			if !fe.IsDir() || !strings.HasPrefix(fe.Name(), "GG-") {
+				continue
+			}
+			ggDir := filesDir + "/" + fe.Name()
+			// 特征验证: version.gg + lib5.so
+			if _, err := os.Stat(ggDir + "/version.gg"); err != nil {
+				continue
+			}
+			if _, err := os.Stat(ggDir + "/lib5.so"); err != nil {
+				continue
+			}
+			pid := findProcessPid(pkg)
+			if pid == 0 {
+				continue // 有GG目录但进程没跑, 跳过
+			}
+			ver := ""
+			if b, err := os.ReadFile(ggDir + "/version.gg"); err == nil {
+				ver = strings.TrimSpace(string(b))
+			}
+			return &GGBindInfo{
+				Package:  pkg,
+				PID:      pid,
+				DataDir:  "/data/data/" + pkg,
+				GGDir:    ggDir,
+				Version:  ver,
+				BindTime: time.Now().Format("2006-01-02 15:04:05"),
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("未发现运行中的GG修改器(扫描/data/data/*/files/GG-* 无结果或进程未运行)")
+}
+
+// VerifyBind 验证已绑定GG是否仍存活, 返回刷新后的PID
+func VerifyBind(b GGBindInfo) (int, bool) {
+	if b.Package == "" {
+		return 0, false
+	}
+	pid := findProcessPid(b.Package)
+	return pid, pid != 0
 }
 
 func (c *Config) Save() error {
