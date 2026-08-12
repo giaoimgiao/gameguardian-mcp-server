@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -77,6 +78,13 @@ func strSchema(desc string, required ...bool) map[string]interface{} {
 
 func boolSchema(desc string) map[string]interface{} {
 	return map[string]interface{}{"type": "boolean", "description": desc}
+}
+func arrSchema(desc string, required ...bool) map[string]interface{} {
+	m := map[string]interface{}{"type": "array", "description": desc, "items": map[string]interface{}{"type": "string"}}
+	if len(required) > 0 && required[0] {
+		m["x-required"] = true
+	}
+	return m
 }
 
 func intSchema(desc string, extra ...bool) map[string]interface{} {
@@ -151,9 +159,12 @@ var tools = []toolDef{
 		}, []string{"type"}),
 	},
 	{
-		Name: "gg_search_refine", Title: "模糊搜索细化", Description: "模糊搜索细化: 与上一次快照比较。mode: increased(增大)/decreased(减小)/unchanged(不变)/changed(改变)。",
+		Name: "gg_search_refine", Title: "模糊搜索细化", Description: "模糊搜索细化: 与上一次快照比较。mode: increased(增大)/decreased(减小)/unchanged(不变)/changed(改变)/range(值范围过滤, 配minValue/maxValue)。range模式适合过滤坐标: 坐标值必在地图尺寸内, 垃圾值不在。",
 		InputSchema: objectSchema("", map[string]interface{}{
-			"mode": strSchema("increased|decreased|unchanged|changed", true),
+			"mode":        strSchema("increased|decreased|unchanged|changed|range", true),
+			"minValue":    intSchema("range模式: 最小浮点值"),
+			"maxValue":    intSchema("range模式: 最大浮点值"),
+			"minAbsValue": intSchema("range模式: 最小绝对值(剔除1e-17级垃圾值)"),
 		}, []string{"mode"}),
 	},
 	{
@@ -182,6 +193,16 @@ var tools = []toolDef{
 			"address": strSchema("地址, 如0x7f8a1234", true),
 			"type":    strSchema("类型: byte|word|dword|qword|float|double", true),
 		}, []string{"address", "type"}),
+	},
+	{
+		Name: "gg_watch", Title: "持续监控地址", Description: "持续监控一组地址的值变化(坐标流/动态值检测)。采样期间值变化会按时间记录, 返回每地址变化次数/起止值/动态判定。适合监控NPC坐标、玩家属性等持续变化的值。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"addresses":   arrSchema("地址数组, 如[\"0x8ACBB74C\",\"0x8ACBB750\"]", true),
+			"type":        strSchema("类型: byte|word|dword|qword|float|double", true),
+			"durationMs":  intSchema("监控时长ms(默认3000)"),
+			"intervalMs":  intSchema("采样间隔ms(默认100, 最小10)"),
+			"onlyChanges": boolSchema("只记录变化(默认true)"),
+		}, []string{"addresses", "type"}),
 	},
 	{
 		Name: "gg_read_bytes", Title: "读原始字节", Description: "读取目标进程内存原始字节(hex)。",
@@ -233,6 +254,19 @@ var tools = []toolDef{
 		InputSchema: objectSchema("", map[string]interface{}{
 			"id": strSchema("冻结ID或'all'", true),
 		}, []string{"id"}),
+	},
+	{
+		Name: "gg_freeze_results", Title: "批量冻结结果集", Description: "把当前搜索结果(全部或过滤后)批量冻结为同一值——解决'1560个候选逐地址冻结'的痛点。支持值范围过滤(excludeNaN/minValue/maxValue/minAbsValue)和pairOnly(只冻结相邻8字节成对的X/Z坐标对)。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"value":        strSchema("冻结值(必填)", true),
+			"type":         strSchema("类型,默认搜索类型"),
+			"minValue":     map[string]interface{}{"type": "number", "description": "可选:只冻结当前值>=此值的候选"},
+			"maxValue":     map[string]interface{}{"type": "number", "description": "可选:只冻结当前值<=此值的候选"},
+			"minAbsValue":  map[string]interface{}{"type": "number", "description": "可选:只冻结|当前值|>=此值的候选"},
+			"excludeNaN":   boolSchema("可选:剔除NaN候选,默认true"),
+			"pairOnly":     boolSchema("可选:只冻结'成对地址'(addr与addr+8都在候选集)——用于锁定坐标X/Z对,避免误冻动画/计时器噪声"),
+			"maxCount":     intSchema("可选:最多冻结个数,默认2000(防呆,防止一次冻结过多导致游戏崩溃)"),
+		}, []string{"value"}),
 	},
 	{
 		Name: "gg_pause", Title: "暂停进程", Description: "暂停目标进程(断点模拟): SIGSTOP。",
@@ -671,17 +705,35 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 			return nil, err
 		}
 		mode := getStr(args, "mode")
+		var minV, maxV *float64
+		if mv, ok := args["minValue"].(float64); ok {
+			minV = &mv
+		}
+		if mv, ok := args["maxValue"].(float64); ok {
+			maxV = &mv
+		}
+		var minAbs *float64
+		if mv, ok := args["minAbsValue"].(float64); ok {
+			minAbs = &mv
+		}
 		switch mode {
-		case "increased", "decreased", "unchanged", "changed":
+		case "increased", "decreased", "unchanged", "changed", "range":
 		default:
-			return nil, fmt.Errorf("mode 必须是 increased/decreased/unchanged/changed")
+			return nil, fmt.Errorf("mode 必须是 increased/decreased/unchanged/changed/range")
+		}
+		if mode == "range" && minV == nil && maxV == nil {
+			return nil, fmt.Errorf("range模式需要minValue或maxValue")
 		}
 		start := time.Now()
-		n, err := session.FuzzyRefine(mode)
+		n, err := session.FuzzyRefine(mode, minV, maxV, minAbs)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]interface{}{"candidates": n, "elapsedMs": time.Since(start).Milliseconds()}, nil
+		resp := map[string]interface{}{"candidates": n, "elapsedMs": time.Since(start).Milliseconds(), "mode": mode}
+		if mode == "range" {
+			resp["tip"] = "值范围过滤: 保留当前值在[minValue,maxValue]内的候选(坐标过滤利器)"
+		}
+		return resp, nil
 
 	case "gg_search_range":
 		if err := requireTarget(); err != nil {
@@ -802,6 +854,46 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		return map[string]interface{}{
 			"address": fmt.Sprintf("0x%x", addr), "type": t.Name,
 			"value": renderValue(buf, t), "hex": renderHex(buf),
+		}, nil
+
+	case "gg_watch":
+		if err := requireTarget(); err != nil {
+			return nil, err
+		}
+		rawAddrs, ok := args["addresses"].([]interface{})
+		if !ok || len(rawAddrs) == 0 {
+			return nil, fmt.Errorf("addresses 必须是地址数组, 如[\"0x8ACBB74C\"]")
+		}
+		var addrs []uintptr
+		for _, ra := range rawAddrs {
+			as, ok := ra.(string)
+			if !ok {
+				return nil, fmt.Errorf("地址必须是字符串: %v", ra)
+			}
+			a, err := parseAddr(as)
+			if err != nil {
+				return nil, fmt.Errorf("地址解析失败 %s: %v", as, err)
+			}
+			addrs = append(addrs, a)
+		}
+		t, err := typeByName(getStr(args, "type"))
+		if err != nil {
+			return nil, err
+		}
+		duration := getInt(args, "durationMs", 3000)
+		interval := getInt(args, "intervalMs", 100)
+		onlyChanges := true
+		if v, ok := args["onlyChanges"].(bool); ok {
+			onlyChanges = v
+		}
+		start := time.Now()
+		res, err := session.WatchAddrs(addrs, t, int64(duration), int64(interval), onlyChanges)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{
+			"watch": res, "elapsedMs": time.Since(start).Milliseconds(),
+			"tip": "active=true的地址在持续变化(动态值, 如坐标); 配合gg_freeze可锁值, 配合gg_hex_dump看结构",
 		}, nil
 
 	case "gg_read_bytes":
@@ -1119,6 +1211,138 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		session.mu.Unlock()
 		return map[string]interface{}{"unfrozen": id, "confirmed": true}, nil
 
+	case "gg_freeze_results":
+		if err := requireTarget(); err != nil {
+			return nil, err
+		}
+		if session.Search == nil {
+			return nil, fmt.Errorf("没有搜索结果,请先搜索")
+		}
+		vs := getStr(args, "value")
+		if vs == "" {
+			return nil, fmt.Errorf("value必填(批量冻结值)")
+		}
+		var t MemType
+		if ts := getStr(args, "type"); ts != "" {
+			var err error
+			t, err = typeByName(ts)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			t = session.Search.Type
+		}
+		val, err := parseValue(vs, t)
+		if err != nil {
+			return nil, err
+		}
+		// 过滤参数
+		var minV, maxV, minAbs *float64
+		if f, ok := args["minValue"].(float64); ok {
+			minV = &f
+		}
+		if f, ok := args["maxValue"].(float64); ok {
+			maxV = &f
+		}
+		if f, ok := args["minAbsValue"].(float64); ok {
+			minAbs = &f
+		}
+		excludeNaN := true
+		if b, ok := args["excludeNaN"].(bool); ok {
+			excludeNaN = b
+		}
+		pairOnly := false
+		if b, ok := args["pairOnly"].(bool); ok {
+			pairOnly = b
+		}
+		maxCount := 2000
+		if f, ok := args["maxCount"].(float64); ok {
+			maxCount = int(f)
+		}
+		if maxCount <= 0 || maxCount > 100000 {
+			maxCount = 2000
+		}
+		// 收集全部候选
+		var all []uintptr
+		if session.Search.FuzzyInit {
+			all = session.FuzzyResults(100000000)
+		} else {
+			all = session.Search.Candidates
+		}
+		if len(all) > maxCount {
+			all = all[:maxCount]
+		}
+		// pairOnly: addr与addr+8都要在候选集(坐标X/Z对)
+		var pairSet map[uintptr]bool
+		if pairOnly {
+			pairSet = make(map[uintptr]bool, len(all))
+			for _, a := range all {
+				pairSet[a] = true
+			}
+		}
+		// 值过滤
+		buf := make([]byte, 8)
+		var kept []uintptr
+		for _, a := range all {
+			if pairOnly && !pairSet[a+8] {
+				continue
+			}
+			if minV != nil || maxV != nil || minAbs != nil || excludeNaN {
+				if err := session.Mem.ReadAt(a, buf[:t.Size]); err != nil {
+					continue
+				}
+				v := bytesToFloatVal(buf[:t.Size])
+				if excludeNaN && v != v {
+					continue
+				}
+				if minV != nil && v < *minV {
+					continue
+				}
+				if maxV != nil && v > *maxV {
+					continue
+				}
+				if minAbs != nil && math.Abs(v) < *minAbs {
+					continue
+				}
+			}
+			kept = append(kept, a)
+		}
+		// 批量冻结
+		frozen := 0
+		now := time.Now().UnixNano()
+		for i, a := range kept {
+			id := fmt.Sprintf("fr%d_%d", now, i)
+			stop := make(chan struct{})
+			done := make(chan struct{})
+			session.mu.Lock()
+			if old, ok := session.Frozen[id]; ok {
+				old.StopFreeze()
+				old.WaitDone(2 * time.Second)
+			}
+			session.Frozen[id] = &FrozenEntry{Addr: a, Type: t, Value: val, Stop: stop, Done: done}
+			session.mu.Unlock()
+			go func(addr uintptr) {
+				defer close(done)
+				interval := time.Duration(cfg.FreezeIntervalMs) * time.Millisecond
+				for {
+					select {
+					case <-stop:
+						return
+					case <-time.After(interval):
+						session.Mem.WriteAt(addr, val)
+					}
+				}
+			}(a)
+			frozen++
+		}
+		return map[string]interface{}{
+			"total":  len(all),
+			"kept":   len(kept),
+			"frozen": frozen,
+			"value":  vs,
+			"type":   t.Name,
+			"hint":   "用gg_unfreeze id=all解冻全部",
+		}, nil
 	case "gg_pause":
 		if err := requireTarget(); err != nil {
 			return nil, err

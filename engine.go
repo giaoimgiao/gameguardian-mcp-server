@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -177,9 +178,9 @@ type MemIO struct {
 }
 
 func (m *MemIO) ReadAt(addr uintptr, buf []byte) error {
-	// 内核驱动优先(抗检测), 块大小4KB
+	// 内核驱动优先(抗检测), 块大小64KB(v2.9.4: 4KB→64KB减少16倍syscall)
 	if m.Kern != nil && m.Kern.ok {
-		const chunk = 4096
+		const chunk = 64 << 10
 		off := 0
 		for off < len(buf) {
 			n := len(buf) - off
@@ -590,7 +591,29 @@ func selectSegments(segs []MapSeg, region string, rstart, rend uintptr) []MapSeg
 }
 
 func isHeapSeg(s MapSeg) bool {
-	return s.Path == "" && s.Offset == 0 && !strings.Contains(s.Prot, "x") && s.Start < 0x800000000000
+	// 必须可读
+	if s.Prot == "" || !strings.Contains(s.Prot, "r") {
+		return false
+	}
+	// 排除可执行段
+	if strings.Contains(s.Prot, "x") {
+		return false
+	}
+	// 排除内核高位地址
+	if s.Start >= 0x800000000000 {
+		return false
+	}
+	// 匿名段: 纯匿名(Path为空) 或 Android命名匿名段([anon:xxx])
+	// 注意: Android的ART/Unity活跃堆是[anon:dalvik-main space]等带名匿名段
+	isAnon := s.Path == "" || strings.HasPrefix(s.Path, "[anon:")
+	if !isAnon {
+		return false
+	}
+	// 排除设备映射(防御)
+	if strings.Contains(s.Path, "/dev/") {
+		return false
+	}
+	return true
 }
 func isStackSeg(s MapSeg) bool {
 	return strings.Contains(s.Path, "[stack]")
@@ -866,11 +889,20 @@ func (s *GGSession) FuzzyInit(t MemType, region string, rstart, rend uintptr) (u
 		}
 	}
 	// 读快照(带内存上限保护: 超过上限的部分截断, 避免内存炸弹; 上限可通过gg_config_set调整)
+	// v2.9.3策略: 超大段(>上限80%, 如dalvik region space 512MB)跳过不占额度,
+	// 优先保证native小段(libc_malloc等游戏数据段)完整读入 — 否则大段占满上限会导致后续段全漏
+	// v2.9.4: 快照读取多线程化(按段分片, 每worker独立socket), 512MB快照从分钟级降到秒级
+	s.Truncated = false
 	snaps := make([][]byte, len(segs))
 	var snapTotal uint64
 	maxSnap := MaxSnapshotBytes()
 	for i, seg := range segs {
 		sz := uint64(seg.End - seg.Start)
+		if sz > maxSnap*4/5 {
+			s.Truncated = true // 超大段跳过(标记, 不占额度)
+			snaps[i] = nil
+			continue
+		}
 		if snapTotal+sz > maxSnap {
 			sz = maxSnap - snapTotal // 截断到剩余额度
 			s.Truncated = true
@@ -879,15 +911,41 @@ func (s *GGSession) FuzzyInit(t MemType, region string, rstart, rend uintptr) (u
 			snaps[i] = nil
 			continue
 		}
-		data := make([]byte, int(sz))
-		if s.Mem.ReadAt(seg.Start, data) != nil {
-			// 读失败段标记为空快照(该段候选会在refine时被剔除)
-			data = nil
-		} else {
-			snapTotal += uint64(len(data))
-		}
-		snaps[i] = data
+		snaps[i] = make([]byte, int(sz))
+		snapTotal += sz
 	}
+	// 并行读取快照: 每worker独立socket, 按字节分片负载均衡
+	workers := runtime.NumCPU()
+	if workers > 8 {
+		workers = 8
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	chunks := splitSegsByBytes(segs, workers)
+	var wg sync.WaitGroup
+	for w, cr := range chunks {
+		wg.Add(1)
+		go func(w int, cr [2]int) {
+			defer wg.Done()
+			mio := newMemIO(s.Pid)
+			defer func() {
+				if mio.Kern != nil {
+					mio.Kern.Close()
+				}
+			}()
+			for si := cr[0]; si < cr[1]; si++ {
+				if snaps[si] == nil {
+					continue
+				}
+				if mio.ReadAt(segs[si].Start, snaps[si]) != nil {
+					// 读失败段标记为空快照(该段候选会在refine时被剔除)
+					snaps[si] = nil
+				}
+			}
+		}(w, cr)
+	}
+	wg.Wait()
 	s.Search = &SearchState{
 		Pid: s.Pid, Type: t, Aligned: true, Bitmap: bm, Segs: segs,
 		Snapshots: snaps, FuzzyInit: true,
@@ -896,54 +954,113 @@ func (s *GGSession) FuzzyInit(t MemType, region string, rstart, rend uintptr) (u
 }
 
 // FuzzyRefine 模糊细化: 与上一次快照比较, mode=increased/decreased/unchanged/changed
-func (s *GGSession) FuzzyRefine(mode string) (uint64, error) {
+// v2.9.4: 多线程并行(按段分片, 每worker独立socket + 局部位图, 最后合并)
+func (s *GGSession) FuzzyRefine(mode string, minV, maxV, minAbs *float64) (uint64, error) {
 	if s.Search == nil || !s.Search.FuzzyInit {
 		return 0, errors.New("no fuzzy search initialized")
 	}
 	align := s.Search.Type.Size
 	bm := s.Search.Bitmap
+	segs := s.Search.Segs
+	snaps := s.Search.Snapshots
 	keep := make([]uint8, len(bm))
-	segCache := make([]byte, 64*1024)
-	for si, seg := range s.Search.Segs {
-		snap := s.Search.Snapshots[si]
-		if snap == nil {
+	// 预计算每段的bit起始(避免循环内重复O(n)计算)
+	baseOf := make([]uint64, len(segs)+1)
+	for si := range segs {
+		baseOf[si] = segIdxBase(si, segs, align)
+	}
+	baseOf[len(segs)] = segIdxBase(len(segs), segs, align)
+	// 按字节分片并行比较
+	workers := runtime.NumCPU()
+	if workers > 8 {
+		workers = 8
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	chunks := splitSegsByBytes(segs, workers)
+	type chunkKeep struct {
+		start uint64 // 全局bit起始
+		data  []uint8
+	}
+	keeps := make([]chunkKeep, len(chunks))
+	var wg sync.WaitGroup
+	for w, cr := range chunks {
+		wg.Add(1)
+		go func(w int, cr [2]int) {
+			defer wg.Done()
+			if cr[0] >= cr[1] {
+				return
+			}
+			bitStart := baseOf[cr[0]]
+			bitEnd := baseOf[cr[1]]
+			local := make([]uint8, (bitEnd-bitStart+7)/8)
+			mio := newMemIO(s.Pid)
+			defer func() {
+				if mio.Kern != nil {
+					mio.Kern.Close()
+				}
+			}()
+			segCache := make([]byte, 64*1024)
+			for si := cr[0]; si < cr[1]; si++ {
+				seg := segs[si]
+				snap := snaps[si]
+				if snap == nil {
+					continue
+				}
+				base := baseOf[si]
+				addr := seg.Start
+				for addr < seg.End {
+					n := uintptr(len(segCache))
+					if addr+n > seg.End {
+						n = seg.End - addr
+					}
+					if mio.ReadAt(addr, segCache[:n]) != nil {
+						break
+					}
+					// 遍历块内对齐slot(段首不要求按align对齐, slot从段起点开始)
+					for off := uintptr(0); off+uintptr(align) <= n; off += uintptr(align) {
+						rel := addr + off - seg.Start
+						slotIdx := base + uint64(rel)/uint64(align)
+						if !(slotIdx < uint64(len(bm))*8 && bmGet(bm, slotIdx)) {
+							continue
+						}
+						// 快照中的旧值(注意快照长度可能不足, 处理越界)
+						if int(rel)+align > len(snap) {
+							continue
+						}
+						old := snap[rel : rel+uintptr(align)]
+						cur := segCache[off : off+uintptr(align)]
+						if matchFuzzy(old, cur, mode, minV, maxV, minAbs) {
+							bmSet(local, slotIdx-bitStart)
+							// 更新快照为当前值(供下次比较)
+							copy(old, cur)
+						}
+					}
+					addr += n
+				}
+			}
+			keeps[w] = chunkKeep{start: bitStart, data: local}
+		}(w, cr)
+	}
+	wg.Wait()
+	// 合并局部位图到全局(逐set bit)
+	for _, ck := range keeps {
+		if ck.data == nil {
 			continue
 		}
-		addr := seg.Start
-		for addr < seg.End {
-			n := uintptr(len(segCache))
-			if addr+n > seg.End {
-				n = seg.End - addr
+		for li, b := range ck.data {
+			if b == 0 {
+				continue
 			}
-			if s.Mem.ReadAt(addr, segCache[:n]) != nil {
-				break
-			}
-			// 遍历块内对齐slot
-			start := uintptr(0)
-			if addr == seg.Start {
-				// 段首对齐: 段起点本身可能未按align对齐, slot从段起点开始
-				start = 0
-			}
-			for off := start; off+uintptr(align) <= n; off += uintptr(align) {
-				slotAddr := addr + off
-				rel := slotAddr - seg.Start
-				slotIdx := uint64(rel)/uint64(align) + segIdxBase(si, s.Search.Segs, align)
-				if !(slotIdx < uint64(len(bm))*8 && bmGet(bm, slotIdx)) {
-					continue
-				}
-				// 快照中的旧值(注意快照长度可能不足, 处理越界)
-				if int(rel)+align > len(snap) {
-					continue
-				}
-				old := snap[rel : rel+uintptr(align)]
-				cur := segCache[off : off+uintptr(align)]
-				if matchFuzzy(old, cur, mode) {
-					bmSet(keep, slotIdx)
-					// 更新快照为当前值(供下次比较)
-					copy(old, cur)
+			for bi := 0; bi < 8; bi++ {
+				if b&(1<<uint(bi)) != 0 {
+					gi := ck.start + uint64(li)*8 + uint64(bi)
+					if gi < uint64(len(keep))*8 {
+						bmSet(keep, gi)
+					}
 				}
 			}
-			addr += n
 		}
 	}
 	s.Search.Bitmap = keep
@@ -958,7 +1075,42 @@ func segIdxBase(si int, segs []MapSeg, align int) uint64 {
 	return base
 }
 
-func matchFuzzy(old, cur []byte, mode string) bool {
+func bytesToFloatVal(b []byte) float64 {
+	switch len(b) {
+	case 4:
+		return float64(math.Float32frombits(binary.LittleEndian.Uint32(b)))
+	case 8:
+		return math.Float64frombits(binary.LittleEndian.Uint64(b))
+	case 2:
+		return float64(int16(binary.LittleEndian.Uint16(b)))
+	case 1:
+		return float64(int8(b[0]))
+	}
+	return 0
+}
+
+// matchFuzzy 模糊匹配, mode=increased/decreased/unchanged/changed/range
+// range模式: 当前值在[minV,maxV]范围内则保留; minAbs: 最小绝对值过滤(剔除1e-17级垃圾值)
+func matchFuzzy(old, cur []byte, mode string, minV, maxV, minAbs *float64) bool {
+	if mode == "range" {
+		if minV == nil && maxV == nil && minAbs == nil {
+			return true
+		}
+		v := bytesToFloatVal(cur)
+		if v != v { // NaN: 不满足任何范围条件, 直接剔除(否则NaN会漏过所有比较)
+			return false
+		}
+		if minV != nil && v < *minV {
+			return false
+		}
+		if maxV != nil && v > *maxV {
+			return false
+		}
+		if minAbs != nil && math.Abs(v) < *minAbs {
+			return false
+		}
+		return true
+	}
 	cmp := bytes.Compare(old, cur)
 	switch mode {
 	case "increased":
@@ -1212,6 +1364,95 @@ func uniqKeys(m map[uintptr]bool) []uintptr {
 		out = append(out, k)
 	}
 	return out
+}
+
+// ---------- gg_watch 地址持续监控(坐标流/动态值检测) ----------
+
+type WatchSample struct {
+	TimeMs int64  `json:"t"`     // 相对监控开始的毫秒
+	Addr   string `json:"addr"`  // 地址
+	Value  string `json:"value"` // 当前值(按类型渲染)
+	Hex    string `json:"hex"`   // 原始字节hex
+}
+
+type WatchAddrStat struct {
+	Addr      string `json:"addr"`       // 地址
+	Changes   int    `json:"changes"`    // 变化次数
+	StartVal  string `json:"startValue"` // 起始值
+	EndVal    string `json:"endValue"`   // 结束值
+	Active    bool   `json:"active"`     // 是否在持续变化(动态值)
+}
+
+type WatchResult struct {
+	Addrs      []string         `json:"addrs"`      // 监控的地址
+	Type       string           `json:"type"`       // 类型
+	DurationMs int64            `json:"durationMs"` // 监控时长
+	IntervalMs int64            `json:"intervalMs"` // 采样间隔
+	Changes    []WatchSample    `json:"changes"`    // 变化记录(onlyChanges=true时)
+	Stats      []WatchAddrStat  `json:"stats"`      // 每地址统计
+}
+
+// WatchAddrs 持续监控一组地址的值变化(坐标流数据源)
+// durationMs: 监控总时长; intervalMs: 采样间隔; onlyChanges: 只记录变化(默认true)
+func (s *GGSession) WatchAddrs(addrs []uintptr, t MemType, durationMs, intervalMs int64, onlyChanges bool) (*WatchResult, error) {
+	if len(addrs) == 0 {
+		return nil, errors.New("addresses 不能为空")
+	}
+	if durationMs <= 0 {
+		durationMs = 3000
+	}
+	if intervalMs < 10 {
+		intervalMs = 100
+	}
+	res := &WatchResult{
+		Type:       t.Name,
+		DurationMs: durationMs,
+		IntervalMs: intervalMs,
+		Stats:      make([]WatchAddrStat, len(addrs)),
+	}
+	for i, a := range addrs {
+		res.Addrs = append(res.Addrs, fmt.Sprintf("0x%x", a))
+		res.Stats[i].Addr = fmt.Sprintf("0x%x", a)
+	}
+	start := time.Now()
+	prev := make([][]byte, len(addrs))
+	for i := range prev {
+		prev[i] = make([]byte, t.Size)
+	}
+	first := true
+	for time.Since(start) < time.Duration(durationMs)*time.Millisecond {
+		for i, a := range addrs {
+			buf := make([]byte, t.Size)
+			if s.Mem.ReadAt(a, buf) != nil {
+				continue // 读取失败跳过(地址可能已失效)
+			}
+			changed := first || !bytes.Equal(buf, prev[i])
+			if changed {
+				cur := renderValue(buf, t)
+				if first {
+					res.Stats[i].StartVal = cur
+				}
+				res.Stats[i].Changes++
+				res.Stats[i].EndVal = cur
+				if onlyChanges {
+					res.Changes = append(res.Changes, WatchSample{
+						TimeMs: time.Since(start).Milliseconds(),
+						Addr:   fmt.Sprintf("0x%x", a),
+						Value:  cur,
+						Hex:    renderHex(buf),
+					})
+				}
+			}
+			copy(prev[i], buf)
+		}
+		first = false
+		time.Sleep(time.Duration(intervalMs) * time.Millisecond)
+	}
+	// 动态判定: 变化次数>=3 且 起止值不同 = 活跃动态值
+	for i := range res.Stats {
+		res.Stats[i].Active = res.Stats[i].Changes >= 3 && res.Stats[i].StartVal != res.Stats[i].EndVal
+	}
+	return res, nil
 }
 
 // Close 关闭内核通道
