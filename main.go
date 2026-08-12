@@ -99,9 +99,14 @@ var tools = []toolDef{
 		InputSchema: objectSchema("无参数", map[string]interface{}{}, []string{}),
 	},
 	{
-		Name: "gg_list_processes", Title: "进程列表", Description: "列出所有进程(pid/名称/命令行/uid)。可选query按名称或包名过滤。",
+		Name: "gg_list_processes", Title: "进程列表", Description: "列出进程(pid/名称/命令行/uid)。可配置: query过滤, includeKernel(是否含内核线程,默认false), appOnly(仅应用进程), sort(active/pid/adj/name), limit+offset分页扩展。",
 		InputSchema: objectSchema("", map[string]interface{}{
-			"query": strSchema("可选: 按进程名或包名过滤, 支持子串", false),
+			"query":         strSchema("可选: 按进程名或包名过滤, 支持子串", false),
+			"includeKernel": boolSchema("是否包含内核线程, 默认false"),
+			"appOnly":       boolSchema("true=仅显示应用进程(uid>=10000)"),
+			"sort":          strSchema("排序: active(应用优先+活跃度,默认)|pid|adj(活跃度)|name", false),
+			"limit":         intSchema("返回条数, 默认100, 最大1000(超出用offset翻页)"),
+			"offset":        intSchema("偏移, 默认0(配合limit分页扩展)"),
 		}, []string{}),
 	},
 	{
@@ -125,10 +130,10 @@ var tools = []toolDef{
 		}, []string{}),
 	},
 	{
-		Name: "gg_search", Title: "精确搜索", Description: "已知值搜索。type: byte/word/dword/qword/float/double。region: all/heap/stack/anonymous/module 或自定义rangeStart-rangeEnd。**两步搜索**: 先搜当前值→游戏内让值变化→再调本工具并设refine=true(仅在现有结果中过滤,秒级), 命中大幅缩小。",
+		Name: "gg_search", Title: "精确搜索", Description: "已知值搜索。type: auto(自动: byte/word/dword/qword/float全扫,多线程最快)|byte|word|dword|qword|float|double。region: all/heap/stack/anonymous/module 或自定义rangeStart-rangeEnd。**两步搜索**: 先搜当前值→游戏内让值变化→再调本工具并设refine=true(仅在现有结果中过滤,秒级), 命中大幅缩小。",
 		InputSchema: objectSchema("", map[string]interface{}{
 			"value":      strSchema("搜索值, 如 100, 3.14, 0x1A2B, -5", true),
-			"type":       strSchema("类型: byte|word|dword|qword|float|double", true),
+			"type":       strSchema("类型: auto|byte|word|dword|qword|float|double", true),
 			"region":     strSchema("区域: all|heap|stack|anonymous|module, 默认all", false),
 			"rangeStart": strSchema("可选: 起始地址(0x...或十进制)", false),
 			"rangeEnd":   strSchema("可选: 结束地址", false),
@@ -265,6 +270,73 @@ var tools = []toolDef{
 		}, []string{"cmd"}),
 	},
 	{
+		Name: "gg_config_get", Title: "查看配置", Description: "查看服务器运行时配置(搜索上限/快照上限/冻结间隔/分页默认值等)。所有值均可通过gg_config_set动态调整并持久化。",
+		InputSchema: objectSchema("", map[string]interface{}{}, []string{}),
+	},
+	{
+		Name: "gg_config_set", Title: "修改配置", Description: "动态修改服务器配置并持久化到config.json(立即生效)。支持: searchMaxResults(精确搜索最大结果数,0=无限), fuzzyMaxSnapshotMB(模糊快照上限MB), freezeIntervalMs(冻结写入间隔ms), listDefaultLimit/listMaxLimit(进程列表分页), resultsDefaultLimit/resultsMaxLimit(结果查看分页), setAllMax(一键全改最大数)。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"searchMaxResults":    intSchema("返回显示最大结果数(0=无限制, 不影响候选收集)"),
+			"searchCandidateMax":  intSchema("候选全量上限(内存保护, 0=无限; 默认500万)"),
+			"fuzzyMaxSnapshotMB":  intSchema("模糊搜索快照上限MB(最小16)"),
+			"freezeIntervalMs":    intSchema("冻结写入间隔ms(最小5)"),
+			"listDefaultLimit":    intSchema("进程列表默认条数"),
+			"listMaxLimit":        intSchema("进程列表最大条数"),
+			"resultsDefaultLimit": intSchema("结果查看默认条数"),
+			"resultsMaxLimit":     intSchema("结果查看最大条数"),
+			"setAllMax":           intSchema("一键全改最大地址数"),
+		}, []string{}),
+	},
+	{
+		Name: "gg_search_xor", Title: "Xor加密值搜索", Description: "加密值搜索(游戏内存值=明文XOR密钥)。第1步: 搜明文值, 自动统计密钥K分布(众数K=最可能的加密密钥), 并把K=众数的地址设为候选。第2步: 游戏内变值后再次调用并设refine=true, 保留K不变的地址=真身。region/rangeStart/rangeEnd同上。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"value":      strSchema("明文搜索值, 如 4, 100", true),
+			"type":       strSchema("类型: dword|qword(Xor仅支持4/8字节)", true),
+			"region":     strSchema("区域: all|heap|stack|anonymous|module, 默认all", false),
+			"rangeStart": strSchema("可选: 起始地址", false),
+			"rangeEnd":   strSchema("可选: 结束地址", false),
+			"refine":     boolSchema("第2步: 在现有候选中保留密钥K不变的地址"),
+		}, []string{"value", "type"}),
+	},
+	{
+		Name: "gg_snapshot_results", Title: "保存结果快照", Description: "将当前搜索结果保存为命名快照(持久化到磁盘, 跨重启可用)。之后可与其他结果做交叉分析(gg_cross_analyze)。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"id":     strSchema("快照名(可选, 默认自动生成)", false),
+			"source": strSchema("来源描述(如'攻击力搜索12780')", false),
+		}, []string{}),
+	},
+	{
+		Name: "gg_list_snapshots", Title: "列出快照", Description: "列出所有已保存的结果快照(id/进程/类型/数量/来源/时间)。",
+		InputSchema: objectSchema("", map[string]interface{}{}, []string{}),
+	},
+	{
+		Name: "gg_delete_snapshot", Title: "删除快照", Description: "删除指定快照(id='all'删除全部)。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"id": strSchema("快照名或'all'", true),
+		}, []string{"id"}),
+	},
+	{
+		Name: "gg_cross_analyze", Title: "交叉分析", Description: "交叉分析两个结果集(替代外部脚本): 交集地址/仅A/仅B/地址相邻对(结构体特征)/同值交集。snapA/snapB为快照名, 传'current'表示当前搜索结果。gap: 相邻判定间隔字节(默认16)。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"snapA": strSchema("快照名 或 'current'(当前搜索结果)", true),
+			"snapB": strSchema("快照名 或 'current'", true),
+			"gap":   intSchema("地址相邻判定间隔字节, 默认16"),
+		}, []string{"snapA", "snapB"}),
+	},
+	{
+		Name: "gg_analyze_results", Title: "分析结果", Description: "分析当前搜索结果(替代外部脚本): 值分组统计+地址相邻检测(结构体特征)+地址区间分布。maxScan最多分析地址数(默认全部), gap相邻判定间隔字节(默认16)。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"maxScan": intSchema("最多分析地址数, 0=全部(默认)"),
+			"gap":     intSchema("地址相邻判定间隔字节, 默认16"),
+		}, []string{}),
+	},
+	{
+		Name: "gg_export_results", Title: "导出结果", Description: "导出当前搜索结果到文件(JSON格式), 返回文件路径和大小。便于持久化分析。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"path": strSchema("导出路径, 默认/data/local/tmp/ggmcp/results_<时间戳>.json", false),
+		}, []string{}),
+	},
+	{
 		Name: "gg_server_stop", Title: "关闭服务器", Description: "停止ggmcp服务器进程(用完即关: 释放内存、减少驻留痕迹)。再次使用需通过shell执行 /data/local/tmp/ggmcp_ctl.sh start 或重启手机(开机自启)。",
 		InputSchema: objectSchema("", map[string]interface{}{}, []string{}),
 	},
@@ -311,7 +383,13 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		}, nil
 
 	case "gg_list_processes":
-		procs, err := listProcesses()
+		includeKernel, _ := args["includeKernel"].(bool)
+		appOnly, _ := args["appOnly"].(bool)
+		sortMode := getStr(args, "sort")
+		if sortMode == "" {
+			sortMode = "active"
+		}
+		procs, err := listProcesses(includeKernel, appOnly, sortMode)
 		if err != nil {
 			return nil, err
 		}
@@ -324,10 +402,36 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 			}
 			out = append(out, p)
 		}
-		if len(out) > 500 {
-			out = out[:500]
+		// 分页: limit默认取配置(可gg_config_set), offset翻页扩展
+		limit := getInt(args, "limit", cfg.ListDefaultLimit)
+		if limit <= 0 {
+			limit = cfg.ListDefaultLimit
 		}
-		return map[string]interface{}{"count": len(out), "processes": out}, nil
+		if limit > cfg.ListMaxLimit {
+			limit = cfg.ListMaxLimit
+		}
+		offset := getInt(args, "offset", 0)
+		if offset < 0 {
+			offset = 0
+		}
+		total := len(out)
+		start := offset
+		if start > total {
+			start = total
+		}
+		end := start + limit
+		if end > total {
+			end = total
+		}
+		return map[string]interface{}{
+			"total":     total,
+			"returned":  end - start,
+			"limit":     limit,
+			"offset":    offset,
+			"hasMore":   end < total,
+			"filters":   map[string]interface{}{"includeKernel": includeKernel, "appOnly": appOnly, "sort": sortMode},
+			"processes": out[start:end],
+		}, nil
 
 	case "gg_attach":
 		target := getStr(args, "target")
@@ -338,7 +442,8 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		if p, err := strconv.Atoi(target); err == nil {
 			pid = p
 		} else {
-			procs, err := listProcesses()
+			// 按名称找pid: 全量枚举(含内核+应用, 按pid排序, 保证能找到)
+			procs, err := listProcesses(true, false, "pid")
 			if err != nil {
 				return nil, err
 			}
@@ -389,11 +494,16 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		session.mu.Lock()
 		session.Pid = 0
 		session.Search = nil
+		targets := make([]*FrozenEntry, 0, len(session.Frozen))
 		for _, f := range session.Frozen {
-			close(f.Stop)
+			targets = append(targets, f)
 		}
 		session.Frozen = map[string]*FrozenEntry{}
 		session.mu.Unlock()
+		for _, f := range targets {
+			f.StopFreeze()
+			f.WaitDone(3 * time.Second)
+		}
 		return map[string]interface{}{"detached": true}, nil
 
 	case "gg_target_info":
@@ -462,7 +572,28 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		if err := requireTarget(); err != nil {
 			return nil, err
 		}
-		t, err := typeByName(getStr(args, "type"))
+		typeName := getStr(args, "type")
+		// Auto自动类型搜索(byte/word/dword/qword/float全覆盖, 多线程并行)
+		if typeName == "auto" {
+			v, err := strconv.Atoi(strings.TrimSpace(getStr(args, "value")))
+			if err != nil {
+				return nil, fmt.Errorf("auto搜索value必须是整数: %v", err)
+			}
+			rs, re, err := getRange(args)
+			if err != nil {
+				return nil, err
+			}
+			start := time.Now()
+			res, err := session.AutoSearch(v, getStr(args, "region"), rs, re)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]interface{}{
+				"auto": res, "elapsedMs": time.Since(start).Milliseconds(),
+				"tip": "多类型自动搜索完成, 用 gg_get_results 查看; 游戏内变值后 refine=true 锁定",
+			}, nil
+		}
+		t, err := typeByName(typeName)
 		if err != nil {
 			return nil, err
 		}
@@ -495,14 +626,19 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 			aligned = v
 		}
 		start := time.Now()
-		n, err := session.ExactSearch(val, t, getStr(args, "region"), rs, re, aligned)
+		n, truncated, err := session.ExactSearch(val, t, getStr(args, "region"), rs, re, aligned)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]interface{}{
+		resp := map[string]interface{}{
 			"found": n, "elapsedMs": time.Since(start).Milliseconds(),
 			"type": t.Name, "tip": "用 gg_get_results 查看, gg_set_results 批量修改; 建议游戏内变值后用 refine=true 两步搜索锁定真身",
-		}, nil
+		}
+		if truncated {
+			resp["truncated"] = true
+			resp["tip"] = "候选超searchCandidateMax已截断, 可用gg_config_set调大; 用 gg_get_results 查看"
+		}
+		return resp, nil
 
 	case "gg_search_unknown_init":
 		if err := requireTarget(); err != nil {
@@ -523,7 +659,7 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		}
 		tip := "游戏内改变数值后调用 gg_search_refine"
 		if session.Truncated {
-			tip = "快照超过512MB上限被截断(仅覆盖前512MB), 建议用region或rangeStart/rangeEnd缩小范围"
+			tip = fmt.Sprintf("快照超过%dMB上限被截断(仅覆盖前%dMB), 建议用region或rangeStart/rangeEnd缩小范围, 或gg_config_set调大fuzzyMaxSnapshotMB", cfg.FuzzyMaxSnapshotMB, cfg.FuzzyMaxSnapshotMB)
 		}
 		return map[string]interface{}{
 			"candidates": n, "elapsedMs": time.Since(start).Milliseconds(),
@@ -605,10 +741,10 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		if session.Search == nil {
 			return map[string]interface{}{"results": []interface{}{}, "count": 0}, nil
 		}
-		limit := getInt(args, "limit", 50)
+		limit := getInt(args, "limit", cfg.ResultsDefaultLimit)
 		offset := getInt(args, "offset", 0)
-		if limit > 1000 {
-			limit = 1000
+		if limit > cfg.ResultsMaxLimit {
+			limit = cfg.ResultsMaxLimit
 		}
 		t := session.Search.Type
 		var addrs []uintptr
@@ -769,9 +905,13 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 			}
 			var addrs []uintptr
 			if session.Search.FuzzyInit {
-				addrs = session.FuzzyResults(1000000)
+				addrs = session.FuzzyResults(cfg.SetAllMax)
 			} else {
 				addrs = session.Search.Candidates
+			}
+			// 上限保护(可gg_config_set调整)
+			if len(addrs) > cfg.SetAllMax {
+				addrs = addrs[:cfg.SetAllMax]
 			}
 			written := 0
 			var failed int
@@ -893,13 +1033,17 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		} else {
 			return nil, fmt.Errorf("需要 index 或 address")
 		}
-		t := session.Search.Type
+		var t MemType
 		if ts := getStr(args, "type"); ts != "" {
 			var err error
 			t, err = typeByName(ts)
 			if err != nil {
 				return nil, err
 			}
+		} else if session.Search != nil {
+			t = session.Search.Type
+		} else {
+			return nil, fmt.Errorf("未执行过搜索, 请显式指定type(如dword)")
 		}
 		val := make([]byte, t.Size)
 		if vs := getStr(args, "value"); vs != "" {
@@ -919,19 +1063,22 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		}
 		session.mu.Lock()
 		if old, ok := session.Frozen[id]; ok {
-			close(old.Stop)
+			old.StopFreeze() // 替换前先安全停旧的
+			old.WaitDone(2 * time.Second)
 		}
 		stop := make(chan struct{})
-		session.Frozen[id] = &FrozenEntry{Addr: addr, Type: t, Value: val, Stop: stop}
+		done := make(chan struct{})
+		session.Frozen[id] = &FrozenEntry{Addr: addr, Type: t, Value: val, Stop: stop, Done: done}
 		session.mu.Unlock()
 		go func() {
+			defer close(done) // 退出时通知, 解冻可确认
+			interval := time.Duration(cfg.FreezeIntervalMs) * time.Millisecond
 			for {
 				select {
 				case <-stop:
 					return
-				default:
+				case <-time.After(interval):
 					session.Mem.WriteAt(addr, val)
-					time.Sleep(50 * time.Millisecond)
 				}
 			}
 		}()
@@ -940,22 +1087,37 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 	case "gg_unfreeze":
 		id := getStr(args, "id")
 		session.mu.Lock()
+		var targets []*FrozenEntry
 		if id == "all" {
 			for _, f := range session.Frozen {
-				close(f.Stop)
+				targets = append(targets, f)
 			}
-			session.Frozen = map[string]*FrozenEntry{}
+		} else if f, ok := session.Frozen[id]; ok {
+			targets = append(targets, f)
+		} else {
 			session.mu.Unlock()
-			return map[string]interface{}{"unfrozen": "all"}, nil
+			return nil, fmt.Errorf("冻结项不存在: %s", id)
 		}
-		if f, ok := session.Frozen[id]; ok {
-			close(f.Stop)
-			delete(session.Frozen, id)
-			session.mu.Unlock()
-			return map[string]interface{}{"unfrozen": id}, nil
+		// 先全部发出停止信号, 再等待退出确认(避免持锁等待)
+		for _, f := range targets {
+			f.StopFreeze()
 		}
 		session.mu.Unlock()
-		return nil, fmt.Errorf("冻结项不存在: %s", id)
+		// 等待goroutine真正退出, 超时视为解冻失败
+		timeout := 3 * time.Second
+		for _, f := range targets {
+			if !f.WaitDone(timeout) {
+				return nil, fmt.Errorf("解冻超时: goroutine未退出, 请重试或gg_server_stop")
+			}
+		}
+		session.mu.Lock()
+		if id == "all" {
+			session.Frozen = map[string]*FrozenEntry{}
+		} else {
+			delete(session.Frozen, id)
+		}
+		session.mu.Unlock()
+		return map[string]interface{}{"unfrozen": id, "confirmed": true}, nil
 
 	case "gg_pause":
 		if err := requireTarget(); err != nil {
@@ -1047,15 +1209,19 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 			return nil, err
 		}
 		start := time.Now()
-		n, err := session.ExactSearch(val, t, getStr(args, "region"), 0, 0, true)
+		n, truncated, err := session.ExactSearch(val, t, getStr(args, "region"), 0, 0, true)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]interface{}{
+		resp := map[string]interface{}{
 			"found": n, "target": fmt.Sprintf("0x%x", target),
 			"elapsedMs": time.Since(start).Milliseconds(),
 			"tip":       "用 gg_get_results 查看指针地址, 可继续 gg_calc_offset 算基址偏移",
-		}, nil
+		}
+		if truncated {
+			resp["truncated"] = true
+		}
+		return resp, nil
 
 	case "gg_shell":
 		cmd := getStr(args, "cmd")
@@ -1067,6 +1233,223 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 			return nil, err
 		}
 		return map[string]interface{}{"output": out}, nil
+
+	case "gg_config_get":
+		return map[string]interface{}{
+			"config":             cfg,
+			"configPath":         ConfigPath,
+			"tip":                "用 gg_config_set 修改任意项(立即生效+持久化)",
+		}, nil
+
+	case "gg_config_set":
+		type kv struct {
+			k string
+			v *int
+		}
+		items := []kv{
+			{"searchMaxResults", &cfg.SearchMaxResults},
+			{"searchCandidateMax", &cfg.SearchCandidateMax},
+			{"fuzzyMaxSnapshotMB", &cfg.FuzzyMaxSnapshotMB},
+			{"freezeIntervalMs", &cfg.FreezeIntervalMs},
+			{"listDefaultLimit", &cfg.ListDefaultLimit},
+			{"listMaxLimit", &cfg.ListMaxLimit},
+			{"resultsDefaultLimit", &cfg.ResultsDefaultLimit},
+			{"resultsMaxLimit", &cfg.ResultsMaxLimit},
+			{"setAllMax", &cfg.SetAllMax},
+		}
+		var changed []string
+		for _, it := range items {
+			if v, ok := args[it.k].(float64); ok {
+				*it.v = int(v)
+				changed = append(changed, it.k)
+			}
+		}
+		// 合法性校验(与LoadConfig一致)
+		if cfg.SearchMaxResults < 0 || cfg.SearchCandidateMax < 0 || cfg.FuzzyMaxSnapshotMB < 16 || cfg.FreezeIntervalMs < 5 ||
+			cfg.ListDefaultLimit < 1 || cfg.ListMaxLimit < cfg.ListDefaultLimit ||
+			cfg.ResultsDefaultLimit < 1 || cfg.ResultsMaxLimit < cfg.ResultsDefaultLimit ||
+			cfg.SetAllMax < 1 {
+			return nil, fmt.Errorf("配置不合法(检查范围), 已回滚")
+		}
+		if err := cfg.Save(); err != nil {
+			return nil, fmt.Errorf("配置保存失败: %v", err)
+		}
+		return map[string]interface{}{
+			"changed": changed, "config": cfg, "saved": true,
+		}, nil
+
+	case "gg_search_xor":
+		if err := requireTarget(); err != nil {
+			return nil, err
+		}
+		t, err := typeByName(getStr(args, "type"))
+		if err != nil {
+			return nil, err
+		}
+		if t.Size != 4 && t.Size != 8 {
+			return nil, fmt.Errorf("Xor搜索仅支持 dword/qword")
+		}
+		val, err := parseValue(getStr(args, "value"), t)
+		if err != nil {
+			return nil, fmt.Errorf("值解析失败: %v", err)
+		}
+		refine, _ := args["refine"].(bool)
+		rs, re, err := getRange(args)
+		if err != nil {
+			return nil, err
+		}
+		start := time.Now()
+		res, err := session.XorSearch(val, t, getStr(args, "region"), rs, re, refine)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{
+			"xor": res, "elapsedMs": time.Since(start).Milliseconds(),
+		}, nil
+
+	case "gg_snapshot_results":
+		if err := requireTarget(); err != nil {
+			return nil, err
+		}
+		snap, err := session.SaveSnapshot(getStr(args, "id"), getStr(args, "source"))
+		if err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{
+			"snapshot": map[string]interface{}{
+				"id": snap.ID, "pid": snap.Pid, "type": snap.Type,
+				"count": len(snap.Addrs), "source": snap.Source, "createdAt": snap.CreatedAt,
+			},
+			"tip": "用 gg_cross_analyze 与其他结果交叉分析",
+		}, nil
+
+	case "gg_list_snapshots":
+		snaps, err := ListSnapshots()
+		if err != nil {
+			if os.IsNotExist(err) {
+				return map[string]interface{}{"snapshots": []interface{}{}, "tip": "暂无快照"}, nil
+			}
+			return nil, err
+		}
+		var out []map[string]interface{}
+		for _, s := range snaps {
+			out = append(out, map[string]interface{}{
+				"id": s.ID, "pid": s.Pid, "type": s.Type, "count": len(s.Addrs),
+				"source": s.Source, "createdAt": s.CreatedAt,
+			})
+		}
+		return map[string]interface{}{"snapshots": out, "total": len(out)}, nil
+
+	case "gg_delete_snapshot":
+		id := getStr(args, "id")
+		if id == "all" {
+			entries, err := os.ReadDir(SnapshotDir)
+			if err != nil {
+				return map[string]interface{}{"deleted": 0}, nil
+			}
+			n := 0
+			for _, e := range entries {
+				if strings.HasSuffix(e.Name(), ".json") {
+					os.Remove(fmt.Sprintf("%s/%s", SnapshotDir, e.Name()))
+					n++
+				}
+			}
+			return map[string]interface{}{"deleted": n, "tip": "全部快照已删除"}, nil
+		}
+		path := fmt.Sprintf("%s/%s.json", SnapshotDir, id)
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("快照不存在: %s", id)
+		}
+		return map[string]interface{}{"deleted": 1, "id": id}, nil
+
+	case "gg_cross_analyze":
+		if err := requireTarget(); err != nil {
+			return nil, err
+		}
+		a := getStr(args, "snapA")
+		b := getStr(args, "snapB")
+		if a == "" || b == "" {
+			return nil, fmt.Errorf("snapA/snapB 不能为空(快照名或'current')")
+		}
+		gap := uint64(getInt(args, "gap", 16))
+		if gap == 0 {
+			gap = 16
+		}
+		start := time.Now()
+		res, err := session.CrossAnalyze(a, b, gap, a == "current", b == "current")
+		if err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{
+			"cross": res, "elapsedMs": time.Since(start).Milliseconds(),
+			"tip": "交集地址可直接 gg_set_results 修改; 相邻对提示结构体布局",
+		}, nil
+
+	case "gg_analyze_results":
+		if err := requireTarget(); err != nil {
+			return nil, err
+		}
+		if session.Search == nil {
+			return nil, fmt.Errorf("没有搜索结果, 先搜索")
+		}
+		maxScan := getInt(args, "maxScan", 0)
+		gap := uint64(getInt(args, "gap", 16))
+		if gap == 0 {
+			gap = 16
+		}
+		start := time.Now()
+		res := session.AnalyzeResults(maxScan, gap)
+		return map[string]interface{}{
+			"analysis": res, "elapsedMs": time.Since(start).Milliseconds(),
+		}, nil
+
+	case "gg_export_results":
+		if err := requireTarget(); err != nil {
+			return nil, err
+		}
+		if session.Search == nil {
+			return nil, fmt.Errorf("没有搜索结果")
+		}
+		path := getStr(args, "path")
+		if path == "" {
+			path = fmt.Sprintf("/data/local/tmp/ggmcp/results_%d.json", time.Now().Unix())
+		}
+		type item struct {
+			Index int    `json:"index"`
+			Addr  string `json:"address"`
+			Value string `json:"value"`
+		}
+		var items []item
+		var addrs []uintptr
+		if session.Search.FuzzyInit {
+			addrs = session.FuzzyResults(cfg.ResultsMaxLimit)
+		} else {
+			addrs = session.Search.Candidates
+		}
+		buf := make([]byte, session.Search.Type.Size)
+		for i, a := range addrs {
+			v := "?"
+			if session.Mem.ReadAt(a, buf) == nil {
+				v = renderValue(buf, session.Search.Type)
+			}
+			items = append(items, item{Index: i, Addr: fmt.Sprintf("0x%x", a), Value: v})
+		}
+		export := map[string]interface{}{
+			"pid":   session.Pid,
+			"type":  session.Search.Type.Name,
+			"total": len(items),
+			"items": items,
+		}
+		data, err := json.MarshalIndent(export, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(path, data, 0644); err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{
+			"path": path, "size": len(data), "items": len(items),
+		}, nil
 
 	case "gg_server_stop":
 		// 延迟100ms退出, 确保响应先送达客户端
