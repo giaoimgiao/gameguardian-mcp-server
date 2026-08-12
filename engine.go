@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -645,6 +646,7 @@ type Config struct {
 	ResultsMaxLimit    int `json:"resultsMaxLimit"`    // 结果查看最大条数
 	SetAllMax          int `json:"setAllMax"`          // 一键全改最大地址数
 	GGBind             GGBindInfo `json:"ggBind"`      // 绑定的GG修改器(自主发现, 防丢失)
+	LastLua            string `json:"lastLua"`         // 最近一次gg_lua_write的脚本名
 }
 
 // GGBindInfo 绑定的GG修改器信息(随机包名改版GG, 每次安装包名会变)
@@ -779,6 +781,154 @@ func VerifyBind(b GGBindInfo) (int, bool) {
 	}
 	pid := findProcessPid(b.Package)
 	return pid, pid != 0
+}
+
+// extractHistory0 提取 shared_prefs XML 里 history-0(最新保存)的值, 用于检测落盘是否稳定
+func extractHistory0(raw []byte) string {
+	re := regexp.MustCompile(`name="history-0"\s*(?:value="([^"]*)")?\s*>([^<]*)<`)
+	m := re.FindSubmatch(raw)
+	if m == nil {
+		return ""
+	}
+	if len(m[1]) > 0 {
+		return string(m[1])
+	}
+	return string(m[2])
+}
+
+// ---------- GG保存列表读取 ----------
+// GG的保存列表存在GG进程内存的ART堆(dalvik段)中:
+// 保存条目qx = {地址long h, 值long i, 类型byte g, 冻结bool f, 备注String e}, 容器是LongMap(c:[J keys + d:[Object values)。
+// 思路: 扫描GG进程内存(含dalvik段), 找"连续两个long: 第一个∈游戏地址范围"的模式(即qx的h/i字段), 聚簇成列表。
+func GGScanSaved(bind GGBindInfo, gameStart, gameEnd uintptr, maxItems int) (map[string]interface{}, error) {
+	if bind.Package == "" {
+		return nil, fmt.Errorf("未绑定GG修改器, 先执行gg_bind_gg")
+	}
+	pid := bind.PID
+	if pid == 0 {
+		if p := findProcessPid(bind.Package); p != 0 {
+			pid = p
+		} else {
+			return nil, fmt.Errorf("GG进程未运行: %s", bind.Package)
+		}
+	}
+	if gameStart == 0 {
+		gameStart = 0x40000000
+	}
+	if gameEnd == 0 {
+		gameEnd = 0xD0000000
+	}
+	f, err := openMemFile(pid)
+	if err != nil {
+		return nil, fmt.Errorf("无法打开GG进程内存: %v", err)
+	}
+	segs, err := readMaps(pid)
+	if err != nil {
+		return nil, fmt.Errorf("读取GG内存映射失败: %v", err)
+	}
+	type hit struct {
+		ggAddr   uintptr // GG内存中的位置(条目h字段)
+		gameAddr uint32 // 保存的游戏地址
+		value    uint64 // 保存的值(i字段)
+	}
+	var hits []hit
+	buf := make([]byte, 64<<10)
+	totalRead := 0
+	for _, s := range segs {
+		if !strings.Contains(s.Prot, "r") {
+			continue
+		}
+		// 跳过纯文件映射(so/jar/apk/oat)加速; 保留匿名段+dalvik堆(Java对象所在地)
+		if s.Path != "" && !strings.HasPrefix(s.Path, "[") {
+			continue
+		}
+		// dalvik段很大, 但要扫(保存列表是Java对象); 跳过guard
+		low := strings.ToLower(s.Path)
+		if strings.Contains(low, "stack") || strings.Contains(low, "guard") {
+			continue
+		}
+		size := int(s.End - s.Start)
+		if size <= 0 {
+			continue
+		}
+		for off := uintptr(0); off < s.End-s.Start; off += uintptr(len(buf)) {
+			n := len(buf)
+			if rem := int(s.End-s.Start) - int(off); rem < n {
+				n = rem
+			}
+			addr := s.Start + off
+			if _, err := f.ReadAt(buf[:n], int64(addr)); err != nil {
+				break
+			}
+			totalRead += n
+			// 8字节对齐扫描: 连续两个long = {地址h, 值i}
+			for i := 0; i+16 <= n; i += 8 {
+				v1 := uint64(buf[i]) | uint64(buf[i+1])<<8 | uint64(buf[i+2])<<16 | uint64(buf[i+3])<<24 |
+					uint64(buf[i+4])<<32 | uint64(buf[i+5])<<40 | uint64(buf[i+6])<<48 | uint64(buf[i+7])<<56
+				if v1 >= uint64(gameStart) && v1 <= uint64(gameEnd) && v1 != 0 {
+					v2 := uint64(buf[i+8]) | uint64(buf[i+9])<<8 | uint64(buf[i+10])<<16 | uint64(buf[i+11])<<24 |
+						uint64(buf[i+12])<<32 | uint64(buf[i+13])<<40 | uint64(buf[i+14])<<48 | uint64(buf[i+15])<<56
+					hits = append(hits, hit{ggAddr: addr + uintptr(i), gameAddr: uint32(v1), value: v2})
+				}
+			}
+		}
+	}
+	// 聚簇: GG内存中相邻(<=0x1000)的命中归一组(同一保存列表的对象通常相邻分配)
+	sort.Slice(hits, func(i, j int) bool { return hits[i].ggAddr < hits[j].ggAddr })
+	var groups [][]hit
+	for _, h := range hits {
+		if len(groups) == 0 || h.ggAddr-groups[len(groups)-1][len(groups[len(groups)-1])-1].ggAddr > 0x1000 {
+			groups = append(groups, []hit{h})
+		} else {
+			groups[len(groups)-1] = append(groups[len(groups)-1], h)
+		}
+	}
+	// 过滤: 组内>=2个不同地址才是保存列表; 输出按游戏地址去重
+	type savedItem struct {
+		GGAddr   string `json:"ggAddr"`
+		GameAddr string `json:"gameAddr"`
+		Value    uint64 `json:"value"`
+	}
+	var outGroups []map[string]interface{}
+	kept := 0
+	for _, g := range groups {
+		seen := map[uint32]bool{}
+		var items []savedItem
+		for _, h := range g {
+			if seen[h.gameAddr] {
+				continue
+			}
+			seen[h.gameAddr] = true
+			items = append(items, savedItem{
+				GGAddr:   fmt.Sprintf("0x%x", h.ggAddr),
+				GameAddr: fmt.Sprintf("0x%x", h.gameAddr),
+				Value:    h.value,
+			})
+			kept++
+			if maxItems > 0 && kept >= maxItems {
+				break
+			}
+		}
+		if len(items) < 2 {
+			continue
+		}
+		outGroups = append(outGroups, map[string]interface{}{
+			"ggAddrStart": fmt.Sprintf("0x%x", g[0].ggAddr),
+			"count":       len(items),
+			"items":       items,
+		})
+		if maxItems > 0 && kept >= maxItems {
+			break
+		}
+	}
+	return map[string]interface{}{
+		"gg":        bind.Package,
+		"pid":       pid,
+		"scannedMB": totalRead / 1024 / 1024,
+		"range":     fmt.Sprintf("0x%x-0x%x", gameStart, gameEnd),
+		"groups":    outGroups,
+		"hits":      len(hits),
+	}, nil
 }
 
 func (c *Config) Save() error {

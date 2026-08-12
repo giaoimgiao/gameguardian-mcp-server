@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"math"
@@ -115,6 +116,33 @@ var tools = []toolDef{
 	{
 		Name: "gg_unbind_gg", Title: "解绑GG修改器", Description: "解除当前绑定的GG修改器, 清除持久化绑定信息。",
 		InputSchema: objectSchema("无参数", map[string]interface{}{}, []string{}),
+	},
+	{
+		Name: "gg_read_gg_saved", Title: "读GG保存列表", Description: "从绑定的GG修改器进程内存中读取保存列表(你手动保存的地址, 无需复制粘贴)。原理: 扫描GG进程匿名堆+dalvik段, 找'连续两个long=地址+值'(保存条目qx={地址,值,类型,冻结,备注})并聚簇。可选gameStart/gameEnd限定游戏地址范围(加速), maxItems限制返回条数。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"gameStart": map[string]interface{}{"type": "number", "description": "可选: 游戏地址范围下限(默认0x40000000)"},
+			"gameEnd":   map[string]interface{}{"type": "number", "description": "可选: 游戏地址范围上限(默认0xD0000000)"},
+			"maxItems":  intSchema("可选: 最多返回条目(默认200)"),
+		}, []string{}),
+	},
+	{
+		Name: "gg_list_gg_files", Title: "列GG数据文件", Description: "列出绑定GG数据目录下的文件(含GG-rm1m存档目录), 看保存列表/存档/日志文件。返回路径+大小+修改时间。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"path": strSchema("可选: 相对GG数据目录的子目录, 默认整个数据目录(不含cache)"),
+		}, []string{}),
+	},
+	{
+		Name: "gg_lua_write", Title: "生成GG Lua脚本", Description: "生成Lua脚本到/sdcard/ggmcp/, 配合广播(am broadcast --es mcp_script)在GG引擎里执行。脚本可用io.open写输出到<name>.out.txt, 用gg_lua_read_out回读。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"code": strSchema("Lua代码(必填)", true),
+			"name": strSchema("脚本文件名, 默认ggmcp_时间戳.lua"),
+		}, []string{"code"}),
+	},
+	{
+		Name: "gg_lua_read_out", Title: "读GG脚本输出", Description: "读取GG脚本运行后的输出文件(/sdcard/ggmcp/<name>.out.txt, 脚本内用io.open写入)。用于回读搜索结果/保存列表等数据。",
+		InputSchema: objectSchema("", map[string]interface{}{
+			"name": strSchema("脚本名(不含.out.txt), 默认最近一次gg_lua_write的脚本"),
+		}, []string{}),
 	},
 	{
 		Name: "gg_switch_gg", Title: "换绑GG修改器", Description: "重新发现并换绑另一个GG修改器(比如装了新版本随机包名变了)。等于重新执行绑定。",
@@ -433,6 +461,154 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 			"ggBind":   ggBindStatus(),
 		}, nil
 
+	case "gg_read_gg_saved":
+		gs := uintptr(0)
+		if v, ok := args["gameStart"].(float64); ok {
+			gs = uintptr(v)
+		}
+		ge := uintptr(0)
+		if v, ok := args["gameEnd"].(float64); ok {
+			ge = uintptr(v)
+		}
+		maxItems := 200
+		if v, ok := args["maxItems"].(float64); ok {
+			maxItems = int(v)
+		}
+		res, err := GGScanSaved(cfg.GGBind, gs, ge, maxItems)
+		if err != nil {
+			return nil, err
+		}
+		return res, nil
+	case "gg_lua_write":
+		code := getStr(args, "code")
+		if code == "" {
+			return nil, fmt.Errorf("code必填")
+		}
+		name := getStr(args, "name")
+		if name == "" {
+			name = fmt.Sprintf("ggmcp_%d", time.Now().Unix())
+		}
+		if !strings.HasSuffix(name, ".lua") {
+			name += ".lua"
+		}
+		// 安全: 只允许文件名不含路径分隔符
+		if strings.ContainsAny(name, "/\\") {
+			return nil, fmt.Errorf("name不能包含路径")
+		}
+		dir := "/sdcard/ggmcp"
+		if err := os.MkdirAll(dir, 0777); err != nil {
+			return nil, fmt.Errorf("创建目录失败: %v", err)
+		}
+		path := dir + "/" + name
+		if err := os.WriteFile(path, []byte(code), 0666); err != nil {
+			return nil, fmt.Errorf("写入脚本失败: %v", err)
+		}
+		cfg.LastLua = name
+		cfg.Save()
+		return map[string]interface{}{
+			"path": path, "name": name, "size": len(code),
+			"hint": "在GG里打开脚本运行(或手动点击运行), 输出会写到" + dir + "/" + strings.TrimSuffix(name, ".lua") + ".out.txt",
+		}, nil
+	case "gg_lua_read_out":
+		name := getStr(args, "name")
+		if name == "" {
+			name = cfg.LastLua
+		}
+		if name == "" {
+			return nil, fmt.Errorf("没有最近脚本, 请传name或先gg_lua_write")
+		}
+		name = strings.TrimSuffix(name, ".lua")
+		path := "/sdcard/ggmcp/" + name + ".out.txt"
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("读取输出失败(脚本可能还没运行): %v", err)
+		}
+		return map[string]interface{}{
+			"path": path, "size": len(raw), "content": string(raw),
+		}, nil
+	case "gg_read_gg_file":
+		// 读GG数据目录下的文件(shared_prefs/历史/存档), 只读
+		if cfg.GGBind.Package == "" {
+			return nil, fmt.Errorf("未绑定GG修改器, 先执行gg_bind_gg")
+		}
+		rel := getStr(args, "path")
+		if rel == "" {
+			rel = "shared_prefs/" + cfg.GGBind.Package + "_preferences.xml"
+		}
+		// 路径安全: 只允许在GG数据目录内
+		full := cfg.GGBind.DataDir + "/" + rel
+		if !strings.HasPrefix(full, cfg.GGBind.DataDir+"/") {
+			return nil, fmt.Errorf("非法路径: 只能在GG数据目录内")
+		}
+		// 读稳定: GG的shared_prefs是异步写盘(apply), 刚保存完立刻读会读到旧快照。
+		// 连续读直到history-0(最新保存)连续两次一致, 最多8次*300ms; 返回文件mtime供判断。
+		var raw []byte
+		var mtime time.Time
+		lastH0 := "\x00sentinel"
+		for i := 0; i < 8; i++ {
+			if st, err2 := os.Stat(full); err2 == nil {
+				mtime = st.ModTime()
+			}
+			d2, e := os.ReadFile(full)
+			if e != nil {
+				return nil, fmt.Errorf("读取失败: %v", e)
+			}
+			raw = d2
+			if strings.HasSuffix(rel, ".xml") {
+				h0 := extractHistory0(raw)
+				if i > 0 && h0 == lastH0 {
+					break // 连续两次一致, 认为落盘稳定
+				}
+				lastH0 = h0
+				time.Sleep(300 * time.Millisecond)
+			} else {
+				break
+			}
+		}
+		// 解析shared_prefs的XML(只读提取key/value, 用encoding/xml避免regexp反向引用限制)
+		if strings.HasSuffix(rel, ".xml") {
+			type prefItem struct {
+				XMLName xml.Name
+				Name    string `xml:"name,attr"`
+				Value   string `xml:"value,attr"`
+				Text    string `xml:",chardata"`
+			}
+			type prefMap struct {
+				XMLName xml.Name   `xml:"map"`
+				Items   []prefItem `xml:",any"`
+			}
+			var pm prefMap
+			if err := xml.Unmarshal(raw, &pm); err != nil {
+				return nil, fmt.Errorf("XML解析失败: %v", err)
+			}
+			type kv struct {
+				Key   string `json:"key"`
+				Value string `json:"value"`
+			}
+			var kvs []kv
+			for _, it := range pm.Items {
+				if it.Name == "" {
+					continue
+				}
+				v := it.Value
+				if v == "" {
+					v = strings.TrimSpace(it.Text)
+				}
+				kvs = append(kvs, kv{Key: it.Name, Value: v})
+			}
+			return map[string]interface{}{
+				"file":  full,
+				"size":  len(raw),
+				"mtime": mtime.Format("2006-01-02 15:04:05"),
+				"items": kvs,
+			}, nil
+		}
+		return map[string]interface{}{
+			"file":  full,
+			"size":  len(raw),
+			"mtime": mtime.Format("2006-01-02 15:04:05"),
+			"head":  string(raw[:min(len(raw), 4000)]),
+		}, nil
 	case "gg_bind_gg":
 		pkg := getStr(args, "package")
 		var bind *GGBindInfo
