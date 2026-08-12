@@ -1,3 +1,3 @@
-module github.com/gg-mcp/gg-mcp-server
+module github.com/giaoimgiao/gameguardian-mcp-server
 
 go 1.22

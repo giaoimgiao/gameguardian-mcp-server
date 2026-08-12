@@ -1,4 +1,4 @@
-# GG MCP Server · 终端版 GameGuardian
+# GameGuardian MCP Server · 终端版 GameGuardian（GG修改器）
 
 把 **GameGuardian（GG修改器）** 的核心能力搬到 MCP（Model Context Protocol）——让 AI 助手可以直接选择进程、搜索内存、模糊搜索、读写修改、计算偏移、冻结数值、暂停/恢复进程，全部通过标准 MCP 工具调用，**内核级读写、抗检测**。
 
