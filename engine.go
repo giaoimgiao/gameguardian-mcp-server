@@ -395,15 +395,27 @@ func listProcesses() ([]ProcInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	var out []ProcInfo
+	type ps struct {
+		info ProcInfo
+		adj  int  // oom_score_adj: 越小越活跃(前台0/负值, 后台100+)
+		kern bool // 内核线程标记
+	}
+	var out []ps
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
-		if err != nil {
+		if err != nil || pid <= 0 {
 			continue
 		}
 		cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-		cmd := strings.ReplaceAll(string(cmdline), "\x00", " ")
-		cmd = strings.TrimSpace(cmd)
+		cmd := strings.TrimSpace(strings.ReplaceAll(string(cmdline), "\x00", " "))
+		stat, _ := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		ppid := 0
+		if i := strings.LastIndex(string(stat), ")"); i >= 0 {
+			f := strings.Fields(string(stat)[i+1:])
+			if len(f) >= 2 {
+				ppid, _ = strconv.Atoi(f[1])
+			}
+		}
 		status, _ := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
 		var name, uid, rss string
 		for _, line := range strings.Split(string(status), "\n") {
@@ -411,19 +423,53 @@ func listProcesses() ([]ProcInfo, error) {
 				name = strings.TrimSpace(strings.TrimPrefix(line, "Name:"))
 			}
 			if strings.HasPrefix(line, "Uid:") {
-				uid = strings.TrimSpace(strings.Fields(line)[1])
+				if f := strings.Fields(line); len(f) > 1 {
+					uid = f[1]
+				}
 			}
 			if strings.HasPrefix(line, "VmRSS:") {
 				rss = strings.TrimSpace(strings.TrimPrefix(line, "VmRSS:"))
 			}
 		}
+		// 内核线程: 父进程是kthreadd(pid=2) 或 cmdline/status都读不到
+		kern := ppid == 2 || (cmd == "" && name == "")
 		if name == "" {
 			name = cmd
 		}
-		out = append(out, ProcInfo{Pid: pid, Name: name, Cmdline: cmd, Uid: uid, Rss: rss})
+		// 活跃度: oom_score_adj 读取失败给默认值999(排最后)
+		adj := 999
+		if ab, err := os.ReadFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid)); err == nil {
+			if v, err := strconv.Atoi(strings.TrimSpace(string(ab))); err == nil {
+				adj = v
+			}
+		}
+		out = append(out, ps{ProcInfo{Pid: pid, Name: name, Cmdline: cmd, Uid: uid, Rss: rss}, adj, kern})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Pid < out[j].Pid })
-	return out, nil
+	// 排序: ①非内核线程在前 ②应用进程(uid>=10000)优先 ③活跃度(adj小=前台/正在运行)在前 ④pid升序
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.kern != b.kern {
+			return !a.kern
+		}
+		ai, bi := isAppUid(a.info.Uid), isAppUid(b.info.Uid)
+		if ai != bi {
+			return ai
+		}
+		if a.adj != b.adj {
+			return a.adj < b.adj
+		}
+		return a.info.Pid < b.info.Pid
+	})
+	res := make([]ProcInfo, len(out))
+	for i := range out {
+		res[i] = out[i].info
+	}
+	return res, nil
+}
+
+func isAppUid(u string) bool {
+	n, err := strconv.Atoi(u)
+	return err == nil && n >= 10000
 }
 
 func readMaps(pid int) ([]MapSeg, error) {
@@ -532,15 +578,20 @@ type SearchState struct {
 	Segs       []MapSeg  // 当前扫描段
 	Snapshots  [][]byte  // 模糊搜索每段快照(上一次扫描的原始数据)
 	FuzzyInit  bool
+	Truncated  bool // 快照因内存上限被截断(部分区域未纳入比较)
 }
 
+// 模糊搜索快照内存上限(防止大heap把内存吃爆)
+const MaxSnapshotBytes = 512 << 20 // 512MB
+
 type GGSession struct {
-	mu      sync.Mutex
-	Pid     int
-	Kern    *KernelMem
-	Mem     *MemIO
-	Search  *SearchState
-	Frozen  map[string]*FrozenEntry
+	mu        sync.Mutex
+	Pid       int
+	Kern      *KernelMem
+	Mem       *MemIO
+	Search    *SearchState
+	Frozen    map[string]*FrozenEntry
+	Truncated bool // 模糊搜索快照被截断标记
 }
 
 type FrozenEntry struct {
@@ -632,18 +683,33 @@ func (s *GGSession) FuzzyInit(t MemType, region string, rstart, rend uintptr) (u
 	for i := range bm {
 		bm[i] = 0xFF
 	}
-	// 尾部清零(只保留实际slot)
-	for i := bits; i < bits*8; i++ {
-		bm[i/8] &^= 1 << (i % 8)
+	// 尾部清零: 只清最后一个字节里超出实际slot的高位(避免越界)
+	lastByte := bits / 8
+	lastBit := bits % 8
+	if lastBit != 0 {
+		for i := lastBit; i < 8; i++ {
+			bm[lastByte] &^= 1 << i
+		}
 	}
-	// 读快照
+	// 读快照(带内存上限保护: 超过MaxSnapshotBytes的部分截断, 避免内存炸弹)
 	snaps := make([][]byte, len(segs))
+	var snapTotal uint64
 	for i, seg := range segs {
-		sz := int(seg.End - seg.Start)
-		data := make([]byte, sz)
+		sz := uint64(seg.End - seg.Start)
+		if snapTotal+sz > MaxSnapshotBytes {
+			sz = MaxSnapshotBytes - snapTotal // 截断到剩余额度
+			s.Truncated = true
+		}
+		if sz <= 0 {
+			snaps[i] = nil
+			continue
+		}
+		data := make([]byte, int(sz))
 		if s.Mem.ReadAt(seg.Start, data) != nil {
 			// 读失败段标记为空快照(该段候选会在refine时被剔除)
 			data = nil
+		} else {
+			snapTotal += uint64(len(data))
 		}
 		snaps[i] = data
 	}
@@ -742,6 +808,29 @@ func countBits(bm []uint8) uint64 {
 		}
 	}
 	return c
+}
+
+// Refine 两步搜索核心: 在现有结果Candidates中读值过滤, 只保留值==value的地址
+// 用法: 先gg_search当前值 → 游戏内让值变化 → Refine新值 → 命中缩到个位数
+func (s *GGSession) Refine(value []byte, t MemType) (int, error) {
+	if s.Search == nil || s.Search.FuzzyInit {
+		return 0, errors.New("no exact search results to refine (先做精确搜索)")
+	}
+	if t.Size != s.Search.Type.Size {
+		return 0, errors.New("refine类型大小必须与上次搜索一致")
+	}
+	var kept []uintptr
+	buf := make([]byte, t.Size)
+	for _, addr := range s.Search.Candidates {
+		if s.Mem.ReadAt(addr, buf) != nil {
+			continue
+		}
+		if bytes.Equal(buf, value) {
+			kept = append(kept, addr)
+		}
+	}
+	s.Search.Candidates = kept
+	return len(kept), nil
 }
 
 // 收集模糊结果地址

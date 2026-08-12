@@ -125,7 +125,7 @@ var tools = []toolDef{
 		}, []string{}),
 	},
 	{
-		Name: "gg_search", Title: "精确搜索", Description: "已知值搜索。type: byte/word/dword/qword/float/double。region: all/heap/stack/anonymous/module 或自定义rangeStart-rangeEnd。",
+		Name: "gg_search", Title: "精确搜索", Description: "已知值搜索。type: byte/word/dword/qword/float/double。region: all/heap/stack/anonymous/module 或自定义rangeStart-rangeEnd。**两步搜索**: 先搜当前值→游戏内让值变化→再调本工具并设refine=true(仅在现有结果中过滤,秒级), 命中大幅缩小。",
 		InputSchema: objectSchema("", map[string]interface{}{
 			"value":      strSchema("搜索值, 如 100, 3.14, 0x1A2B, -5", true),
 			"type":       strSchema("类型: byte|word|dword|qword|float|double", true),
@@ -133,6 +133,7 @@ var tools = []toolDef{
 			"rangeStart": strSchema("可选: 起始地址(0x...或十进制)", false),
 			"rangeEnd":   strSchema("可选: 结束地址", false),
 			"aligned":    boolSchema("按类型大小对齐(默认true)"),
+			"refine":     boolSchema("两步搜索: 只在现有结果中过滤值为value的地址(需先做过一次搜索)"),
 		}, []string{"value", "type"}),
 	},
 	{
@@ -200,11 +201,13 @@ var tools = []toolDef{
 		}, []string{"address", "value", "type"}),
 	},
 	{
-		Name: "gg_set_results", Title: "批量修改结果", Description: "批量修改搜索结果的值。values: [{index或address, value, type可选}]。",
+		Name: "gg_set_results", Title: "批量修改结果", Description: "批量修改搜索结果的值。两种模式: ①values: [{index或address, value, type可选}] ②all:true + value + type(可选): 一键把全部结果改成同一值(两步搜索锁定后推荐)。",
 		InputSchema: objectSchema("", map[string]interface{}{
 			"values": map[string]interface{}{"type": "array", "description": "[{index:0 或 address:'0x...', value:'9999', type:'dword'}]"},
 			"type":   strSchema("默认类型(省略单项type时使用)", false),
-		}, []string{"values"}),
+			"all":    boolSchema("true=一键修改全部结果(需配合value)"),
+			"value":  strSchema("all=true时必填: 所有结果改为该值", false),
+		}, []string{}),
 	},
 	{
 		Name: "gg_clear_results", Title: "清空结果", Description: "清空搜索结果。",
@@ -260,6 +263,10 @@ var tools = []toolDef{
 		InputSchema: objectSchema("", map[string]interface{}{
 			"cmd": strSchema("shell命令", true),
 		}, []string{"cmd"}),
+	},
+	{
+		Name: "gg_server_stop", Title: "关闭服务器", Description: "停止ggmcp服务器进程(用完即关: 释放内存、减少驻留痕迹)。再次使用需通过shell执行 /data/local/tmp/ggmcp_ctl.sh start 或重启手机(开机自启)。",
+		InputSchema: objectSchema("", map[string]interface{}{}, []string{}),
 	},
 }
 
@@ -463,6 +470,22 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		if err != nil {
 			return nil, fmt.Errorf("值解析失败: %v", err)
 		}
+		// 两步搜索: refine=true 时在现有结果中过滤
+		if refine, _ := args["refine"].(bool); refine {
+			if session.Search == nil || session.Search.FuzzyInit {
+				return nil, fmt.Errorf("refine需要先做一次精确搜索(gg_search), 且不能是模糊搜索")
+			}
+			start := time.Now()
+			n, err := session.Refine(val, t)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]interface{}{
+				"found": n, "elapsedMs": time.Since(start).Milliseconds(),
+				"refined": true, "type": t.Name,
+				"tip": "结果已缩小, 用 gg_get_results 查看, gg_set_results 修改; 若仍多可继续游戏内变值再refine",
+			}, nil
+		}
 		rs, re, err := getRange(args)
 		if err != nil {
 			return nil, err
@@ -478,7 +501,7 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		}
 		return map[string]interface{}{
 			"found": n, "elapsedMs": time.Since(start).Milliseconds(),
-			"type": t.Name, "tip": "用 gg_get_results 查看, gg_set_results 批量修改",
+			"type": t.Name, "tip": "用 gg_get_results 查看, gg_set_results 批量修改; 建议游戏内变值后用 refine=true 两步搜索锁定真身",
 		}, nil
 
 	case "gg_search_unknown_init":
@@ -498,9 +521,13 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
+		tip := "游戏内改变数值后调用 gg_search_refine"
+		if session.Truncated {
+			tip = "快照超过512MB上限被截断(仅覆盖前512MB), 建议用region或rangeStart/rangeEnd缩小范围"
+		}
 		return map[string]interface{}{
 			"candidates": n, "elapsedMs": time.Since(start).Milliseconds(),
-			"tip": "游戏内改变数值后调用 gg_search_refine",
+			"tip": tip,
 		}, nil
 
 	case "gg_search_refine":
@@ -721,6 +748,43 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 		}
 		if session.Search == nil {
 			return nil, fmt.Errorf("没有搜索结果")
+		}
+		// 一键修改全部结果: all=true + value + type
+		if all, _ := args["all"].(bool); all {
+			vs := getStr(args, "value")
+			if vs == "" {
+				return nil, fmt.Errorf("all=true 时需要 value 参数")
+			}
+			t := session.Search.Type
+			if ts := getStr(args, "type"); ts != "" {
+				var err error
+				t, err = typeByName(ts)
+				if err != nil {
+					return nil, err
+				}
+			}
+			val, err := parseValue(vs, t)
+			if err != nil {
+				return nil, fmt.Errorf("值解析失败: %v", err)
+			}
+			var addrs []uintptr
+			if session.Search.FuzzyInit {
+				addrs = session.FuzzyResults(1000000)
+			} else {
+				addrs = session.Search.Candidates
+			}
+			written := 0
+			var failed int
+			for _, a := range addrs {
+				if session.Mem.WriteAt(a, val) == nil {
+					written++
+				} else {
+					failed++
+				}
+			}
+			return map[string]interface{}{
+				"all": true, "written": written, "failed": failed, "total": len(addrs),
+			}, nil
 		}
 		vals, ok := args["values"].([]interface{})
 		if !ok || len(vals) == 0 {
@@ -1003,6 +1067,17 @@ func handleTool(name string, args map[string]interface{}) (interface{}, error) {
 			return nil, err
 		}
 		return map[string]interface{}{"output": out}, nil
+
+	case "gg_server_stop":
+		// 延迟100ms退出, 确保响应先送达客户端
+		go func() {
+			time.Sleep(150 * time.Millisecond)
+			os.Exit(0)
+		}()
+		return map[string]interface{}{
+			"stopped": true,
+			"tip":     "ggmcp服务器已退出(释放内存)。重启: adb shell 'su -c /data/local/tmp/ggmcp_ctl.sh start' 或重启手机",
+		}, nil
 	}
 	return nil, fmt.Errorf("未知工具: %s", name)
 }
